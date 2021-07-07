@@ -25,7 +25,14 @@ Now go make a bot with the language and client of your choice!
 
 > Clients are used to interface with Magma, Obsidian's WebSocket and REST API.
 
-- [obby.js](https://github.com/Sxmurai/obby.js), NodeJS (v14+)
+###### v2
+
+- [slate](https://github.com/Axelancerr/Slate), discord.py (Python 3.7+)
+- [obsidian.py](https://github.com/cloudwithax/obsidian.py), discord.py (Python 3.8+)
+
+###### v1
+
+- [obby.js](https://github.com/Sxmurai/obby.js), generic (NodeJS v14+)
 
 **Want to make your own? Read our [API Docs](/API.md)**
 

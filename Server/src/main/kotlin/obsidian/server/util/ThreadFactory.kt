@@ -20,17 +20,13 @@ import java.util.*
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicInteger
 
-val counter = AtomicInteger()
-fun threadFactory(
-  name: String,
-  daemon: Boolean? = null,
-  priority: Int? = null,
-  exceptionHandler: Thread.UncaughtExceptionHandler? = null
-) =
-  ThreadFactory { runnable ->
-    Thread(runnable, name.format(Locale.ROOT, counter.getAndIncrement())).apply {
-      daemon?.let { this.isDaemon = it }
-      priority?.let { this.priority = priority }
-      exceptionHandler?.let { this.uncaughtExceptionHandler = it }
+fun threadFactory(name: String, daemon: Boolean = false, priority: Int? = null): ThreadFactory {
+  val counter = AtomicInteger()
+  return ThreadFactory { runnable ->
+    Thread(System.getSecurityManager()?.threadGroup ?: Thread.currentThread().threadGroup, runnable).apply {
+      this.name = name.format(Locale.ROOT, counter.getAndIncrement())
+      this.isDaemon = if (!isDaemon) daemon else true
+      priority?.let { this.priority = it }
     }
   }
+}

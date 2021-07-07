@@ -16,140 +16,201 @@
 
 package obsidian.server.io
 
+import io.ktor.application.*
 import io.ktor.auth.*
 import io.ktor.features.*
 import io.ktor.http.*
 import io.ktor.http.cio.websocket.*
-import io.ktor.locations.*
 import io.ktor.request.*
 import io.ktor.response.*
 import io.ktor.routing.*
 import io.ktor.util.*
-import io.ktor.util.pipeline.*
 import io.ktor.websocket.*
-import obsidian.server.Obsidian.config
-import obsidian.server.io.MagmaCloseReason.CLIENT_EXISTS
-import obsidian.server.io.MagmaCloseReason.INVALID_AUTHORIZATION
-import obsidian.server.io.MagmaCloseReason.MISSING_CLIENT_NAME
-import obsidian.server.io.MagmaCloseReason.NO_USER_ID
-import obsidian.server.io.controllers.routePlanner
-import obsidian.server.io.controllers.tracks
-import obsidian.server.util.config.ObsidianConfig
+import kotlinx.coroutines.isActive
+import obsidian.server.Application.config
+import obsidian.server.io.rest.Players.players
+import obsidian.server.io.ws.CloseReasons
+import obsidian.server.io.ws.StatsTask
+import obsidian.server.io.ws.WebSocketHandler
+import obsidian.server.config.spec.Obsidian
+import obsidian.server.io.rest.*
 import obsidian.server.util.threadFactory
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import kotlin.text.Typography.mdash
 
-class Magma private constructor() {
-  /**
-   * Executor
-   */
-  val executor: ScheduledExecutorService =
-    Executors.newSingleThreadScheduledExecutor(threadFactory("Magma Cleanup", daemon = true))
+object Magma {
+
+  val ClientName = AttributeKey<String>("ClientName")
 
   /**
    * All connected clients.
-   * `Client ID -> MagmaClient`
    */
-  private val clients = ConcurrentHashMap<Long, MagmaClient>()
+  val clients = ConcurrentHashMap<Long, MagmaClient>()
 
-  fun use(routing: Routing) {
-    routing {
-      webSocket("/") {
-        val request = call.request
+  /**
+   * Executor used for cleaning up un-resumed sessions.
+   */
+  val cleanupExecutor: ScheduledExecutorService =
+    Executors.newSingleThreadScheduledExecutor(threadFactory("Obsidian Magma-Cleanup"))
 
-        /* Used within logs to easily identify different clients. */
-        val clientName = request.headers["Client-Name"]
-          ?: request.queryParameters["client-name"]
+  private val log: Logger = LoggerFactory.getLogger(Magma::class.java)
 
-        /* check if client names are required, if so check if one is provided. */
-        if (config[ObsidianConfig.RequireClientName] && clientName.isNullOrBlank()) {
-          logger.warn("${request.local.remoteHost} - missing 'Client-Name' header")
-          return@webSocket close(MISSING_CLIENT_NAME)
-        }
+  /**
+   * Adds REST endpoint routes and websocket route
+   */
+  fun Routing.magma() {
+    /* rest endpoints */
+    tracks()
+    planner()
+    players()
 
-        val identification = "${request.local.remoteHost}${if (!clientName.isNullOrEmpty()) "($clientName)" else ""}"
-
-        /* validate authorization. */
-        val auth = request.authorization()
-          ?: request.queryParameters["auth"]
-
-        if (!ObsidianConfig.validateAuth(auth)) {
-          logger.warn("$identification - authentication failed")
-          return@webSocket close(INVALID_AUTHORIZATION)
-        }
-
-        logger.info("$identification - incoming connection")
-
-        /* check for userId */
-        val userId = request.headers["User-Id"]?.toLongOrNull()
-          ?: request.queryParameters["user-id"]?.toLongOrNull()
-
-        if (userId == null) {
-          /* no user id was given, close the connection */
-          logger.info("$identification - missing 'User-Id' header")
-          return@webSocket close(NO_USER_ID)
-        }
-
-        /* check if a client for the provided userId already exists. */
-        var client = clients[userId]
-        if (client != null) {
-          /* check for a resume key, if one was given check if the client has the same resume key/ */
-          val resumeKey: String? = request.headers["Resume-Key"]
-          if (resumeKey != null && client.resumeKey == resumeKey) {
-            /* resume the client session */
-            client.resume(this)
-            return@webSocket
-          }
-
-          return@webSocket close(CLIENT_EXISTS)
-        }
-
-        /* create client */
-        client = MagmaClient(clientName, userId, this)
-        clients[userId] = client
-
-        /* listen for incoming messages */
-        try {
-          client.listen()
-        } catch (ex: Throwable) {
-          logger.error("${client.identification} -", ex)
-          close(CloseReason(4005, ex.message ?: "unknown exception"))
-        }
-
-        client.handleClose()
-      }
-
-      authenticate {
-        get("/stats") {
-          context.respond(StatsBuilder.build())
-        }
+    authenticate {
+      get("/stats") {
+        val client = call.request.userId()?.let { clients[it] }
+        val stats = StatsTask.build(client)
+        call.respond(stats)
       }
     }
 
-    routing.tracks()
-    routing.routePlanner()
-  }
+    intercept(ApplicationCallPipeline.Call) {
+      /* extract client name from the request */
+      val clientName = call.request.clientName()
 
-  suspend fun shutdown(client: MagmaClient) {
-    client.shutdown()
-    clients.remove(client.clientId)
-  }
+      /* log out the request */
+      log.info(with(call.request) {
+        "${clientName ?: origin.remoteHost} ${Typography.ndash} ${httpMethod.value.padEnd(4, ' ')} $uri"
+      })
 
-  suspend fun shutdown() {
-    if (clients.isNotEmpty()) {
-      logger.info("Shutting down ${clients.size} clients.")
-      for ((_, client) in clients) {
-        client.shutdown()
+      /* check if a client name is required, if so check if there was a provided client name */
+      if (clientName == null && config[Obsidian.requireClientName]) {
+        return@intercept respondAndFinish(HttpStatusCode.BadRequest, Response("Missing 'Client-Name' header or query parameter."))
       }
-    } else {
-      logger.info("No clients to shutdown.")
+
+      if (clientName != null) {
+        call.attributes.put(ClientName, clientName)
+      }
+    }
+
+    /* websocket */
+    webSocket("/magma") {
+      val request = call.request
+
+      /* check if client names are required, if so check if one was supplied */
+      val clientName = request.clientName()
+      if (config[Obsidian.requireClientName] && clientName.isNullOrBlank()) {
+        log.warn("${request.local.remoteHost} - missing 'Client-Name' header/query parameter.")
+        return@webSocket close(CloseReasons.MISSING_CLIENT_NAME)
+      }
+
+      /* used within logs to easily identify different clients */
+      val display = "${request.local.remoteHost}${if (!clientName.isNullOrEmpty()) "($clientName)" else ""}"
+
+      /* validate authorization */
+      val auth = request.authorization()
+        ?: request.queryParameters["auth"]
+
+      if (!Obsidian.Server.validateAuth(auth)) {
+        log.warn("$display - authentication failed")
+        return@webSocket close(CloseReasons.INVALID_AUTHORIZATION)
+      }
+
+      log.info("$display - incoming connection")
+
+      /* check for user id */
+      val userId = request.userId()
+      if (userId == null) {
+        /* no user-id was given, close the connection */
+        log.info("$display - missing 'User-Id' header/query parameter")
+        return@webSocket close(CloseReasons.MISSING_USER_ID)
+      }
+
+      val client = clients[userId]
+        ?: createClient(userId, clientName)
+
+      val wsh = client.websocket
+      if (wsh != null) {
+        /* check for a resume key, if one was given check if the client has the same resume key/ */
+        val resumeKey: String? = request.headers["Resume-Key"]
+        if (resumeKey != null && wsh.resumeKey == resumeKey) {
+          /* resume the client session */
+          wsh.resume(this)
+          return@webSocket
+        }
+
+        return@webSocket close(CloseReasons.DUPLICATE_SESSION)
+      }
+
+      handleWebsocket(client, this)
     }
   }
 
-  companion object {
-    val magma: Magma by lazy { Magma() }
-    private val logger = LoggerFactory.getLogger(Magma::class.java)
+  fun getClient(userId: Long, clientName: String? = null): MagmaClient {
+    return clients[userId] ?: createClient(userId, clientName)
+  }
+
+  /**
+   * Creates a [MagmaClient] for the supplied [userId] with an optional [clientName]
+   *
+   * @param userId
+   * @param clientName
+   */
+  fun createClient(userId: Long, clientName: String? = null): MagmaClient {
+    return MagmaClient(userId).also {
+      it.name = clientName
+      clients[userId] = it
+    }
+  }
+
+  /**
+   * Extracts the 'User-Id' header or 'user-id' query parameter from the provided [request]
+   *
+   * @param request
+   *   [ApplicationRequest] to extract the user id from.
+   */
+  private fun extractUserId(request: ApplicationRequest): Long? {
+    return request.headers["user-id"]?.toLongOrNull()
+      ?: request.queryParameters["user-id"]?.toLongOrNull()
+  }
+
+  fun ApplicationRequest.userId(): Long? =
+    extractUserId(this)
+
+  /**
+   * Extracts the 'Client-Name' header or 'client-name' query parameter from the provided [request]
+   *
+   * @param request
+   *   [ApplicationRequest] to extract the client name from.
+   */
+  private fun extractClientName(request: ApplicationRequest): String? {
+    return request.headers["Client-Name"]
+      ?: request.queryParameters["client-name"]
+  }
+
+  fun ApplicationRequest.clientName(): String? =
+    extractClientName(this)
+
+  /**
+   * Handles a [WebSocketServerSession] for the supplied [client]
+   */
+  private suspend fun handleWebsocket(client: MagmaClient, wss: WebSocketServerSession) {
+    val wsh = WebSocketHandler(client, wss).also {
+      client.websocket = it
+    }
+
+    /* listen for incoming messages. */
+    try {
+      wsh.listen()
+    } catch (ex: Exception) {
+      log.error("${client.displayName} - An error occurred while listening for frames.", ex)
+      if (wss.isActive) {
+        wss.close(CloseReason(4006, ex.message ?: ex.cause?.message ?: "unknown error"))
+      }
+    }
+
+    wsh.handleClose()
   }
 }
